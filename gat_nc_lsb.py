@@ -24,6 +24,9 @@ from tqdm import tqdm
 import argparse
 from quantize_function.u_quant_func_bit_debug import *
 import pdb
+from torch_geometric.utils import to_networkx, degree
+import networkx as nx
+from utils.quant_utils import analysis_bit
 
 def paras_group(model):
     all_params = model.parameters()
@@ -38,6 +41,7 @@ def paras_group(model):
     quant_paras_scale_gat = []
     other_paras = []
     for name,para in model.named_parameters():
+        print(name)
         if('quant' in name and 'bit' in name and 'weight' in name):
             quant_paras_bit_weight+=[para]
             # para.requires_grad = False
@@ -67,7 +71,7 @@ def setup_seed(seed):
      torch.cuda.manual_seed_all(seed)
      np.random.seed(seed)
      random.seed(seed)
-    #  torch.backends.cudnn.deterministic = True
+     torch.backends.cudnn.deterministic = True
 
 
 def parameter_stastic(model,dataset,hidden_units,heads):
@@ -104,6 +108,163 @@ def load_checkpoint(model, checkpoint):
         print("loaded finished!")
     return model
 
+def make_bit_assignments(data, max_feat_bit=4, min_feat_bit=1):
+    # 1. Degree
+    deg = degree(data.edge_index[1], data.num_nodes, dtype=torch.float)
+    deg = torch.log1p(deg) / torch.log1p(deg.max())
+
+    # 2. Betweenness
+    G = to_networkx(data)
+    betw = torch.tensor([b for n, b in nx.betweenness_centrality(G).items()], device=data.edge_index.device)
+    # betw = betw / betw.max()
+    betw_a = 10000
+    betw = torch.log1p(betw_a * betw) / torch.log1p(betw_a * betw.max())
+
+    # # 5. Preliminary bits in [1…max_feat_bit]
+    # b_pre = (max_feat_bit*deg).round()
+    b_deg = min_feat_bit + ((max_feat_bit - min_feat_bit) * deg).round()
+    b_betw = min_feat_bit + ((max_feat_bit - min_feat_bit) * betw).round()
+    b_pre = torch.maximum(b_deg, b_betw)
+
+    # 6. Push anything above half‐max up to max
+    # b = b_deg.clone()
+    # b = b_betw.clone()
+    b = b_pre.clone()
+    # b[b_pre >= 2] = max_feat_bit
+    print(f"Average bit allocation: {b.float().mean():.2f}")
+    unique_vals, counts = torch.unique(b, return_counts=True)
+    for val, count in zip(unique_vals.tolist(), counts.tolist()):
+        print(f"Bit width {val}: {count} nodes")
+    return b
+
+class quantGATConv(MessagePassing):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        heads: int,
+        bit_assign: torch.Tensor,
+        weight_bit: int = 4,
+        negative_slope: float = 0.2,
+        dropout: float = 0.0,
+        concat: bool = True,
+        bias: bool = True,
+    ):
+        super().__init__(aggr="add", node_dim=0)
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.heads = heads
+        self.concat = concat
+        self.negative_slope = negative_slope
+        self.dropout = dropout
+        self.weight_bit = weight_bit
+
+        # per-node bit assignment buffer, shape = [num_nodes]
+        self.register_buffer("bit_assign", bit_assign)
+
+        # linear projection (no learned quant)
+        self.lin = torch.nn.Linear(in_ch, heads * out_ch, bias=bias)
+
+        # raw attention parameter [1, heads, 2*out_ch]
+        self.att = torch.nn.Parameter(torch.Tensor(1, heads, 2 * out_ch))
+
+        if bias and concat:
+            self.bias = torch.nn.Parameter(torch.Tensor(heads * out_ch))
+        elif bias and not concat:
+            self.bias = torch.nn.Parameter(torch.Tensor(out_ch))
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        glorot(self.lin.weight)
+        glorot(self.att)
+        if self.lin.bias is not None:
+            zeros(self.lin.bias)
+        if self.bias is not None:
+            zeros(self.bias)
+    def forward(self, x, edge_index, size=None, first_layer=True):
+        # ---- 1) Quantize the Linear Weight & apply it ----
+        w = self.lin.weight
+        w_q = STEQuantFn.apply(w, self.weight_bit)
+        fea = F.linear(x, w_q, self.lin.bias)
+
+        # # FIXED PRECISION Quantization
+        # x = STEQuantFn.apply(fea,1)
+
+        # ---- 2) Mixed-precision feature quant by in-degree bit_assign ----
+        fea_q = fea.clone()
+        for b in torch.unique(self.bit_assign):
+            mask = (self.bit_assign == b)
+            if mask.any():
+                rows = mask.nonzero(as_tuple=True)[0]
+                fea_q[rows] = STEQuantFn.apply(fea[rows], int(b.item()))
+        x = fea_q
+
+        # ---- 3) Prepare graph topology ----
+        if size is None and torch.is_tensor(x):
+            edge_index, _ = remove_self_loops(edge_index)
+            edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+
+        return self.propagate(edge_index, x=x, size=size)
+   
+    def message(self, edge_index_i, x_i, x_j, size_i):
+        # reshape for multi-head
+        x_j = x_j.view(-1, self.heads, self.out_ch)
+
+        # ---- 4) Quantize raw attention params ----
+        att = self.att.squeeze(0)                           # [heads, 2*out_ch]
+        att_q = STEQuantFn.apply(att, self.weight_bit)      # 4-bit
+        att_q = att_q.unsqueeze(0)                          # [1, heads, 2*out_ch]
+
+        # compute attention scores
+        if x_i is None:
+            alpha = (x_j * att_q[:, :, self.out_ch:]).sum(dim=-1)
+        else:
+            x_i = x_i.view(-1, self.heads, self.out_ch)
+            alpha = (torch.cat([x_i, x_j], dim=-1) * att_q).sum(dim=-1)
+
+        # ---- 5) Quantize the edge scores ----
+        alpha = alpha.T                                    # [heads, E]
+        alpha_q = STEQuantFn.apply(alpha, self.weight_bit)
+        alpha = alpha_q.T
+
+        alpha = F.leaky_relu(alpha, self.negative_slope)
+        alpha = softmax(alpha, index=edge_index_i, num_nodes=size_i)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        return x_j * alpha.view(-1, self.heads, 1)
+    
+    def update(self, aggr_out):
+        if self.concat:
+            aggr_out = aggr_out.view(-1, self.heads * self.out_ch)
+        else:
+            aggr_out = aggr_out.mean(dim=1)
+
+        if self.bias is not None:
+            aggr_out = aggr_out + self.bias
+        return aggr_out
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.in_ch}, {self.out_ch}, heads={self.heads})"
+
+
+class STEQuantFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, num_bits):
+        qmin, qmax = 0, 2**num_bits - 1
+        min_val, max_val = x.min(), x.max()
+        scale = (max_val - min_val) / (qmax - qmin)
+        zp = min_val
+        x_q = torch.clamp(((x - zp) / scale).round(), qmin, qmax) * scale + zp
+        return x_q
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # STE: pass gradient as-is
+        return grad_output, None
+    
 class qGATConv(MessagePassing):
     def __init__(
         self,
@@ -223,10 +384,11 @@ class GAT(torch.nn.Module):
         num_nodes = dataset.data.num_nodes
         self.is_q = is_q
         self.drop_out=drop_out
-        self.conv1 = qGATConv(dataset.num_node_features, hidden_units, heads=heads,dropout=drop_attn,num_nodes=num_nodes, bit=bit, all_positive=False,
-                                quant_fea=False,is_q=is_q,)
-        self.conv2 = qGATConv(hidden_units*heads,dataset.num_classes, heads=1, dropout=drop_attn, num_nodes=num_nodes, bit=bit, all_positive=True,
-                                quant_fea=True,is_q=is_q)
+        # self.conv1 = qGATConv(dataset.num_node_features, hidden_units, heads=heads,dropout=drop_attn,num_nodes=num_nodes, bit=bit, all_positive=False,quant_fea=False,is_q=is_q,)
+        self.conv1 = quantGATConv(dataset.num_node_features, hidden_units, heads=heads, bit_assign=bit_assign, dropout=drop_attn)
+        # self.conv2 = qGATConv(hidden_units*heads,dataset.num_classes, heads=1, dropout=drop_attn, num_nodes=num_nodes, bit=bit, all_positive=True,quant_fea=True,is_q=is_q)
+        self.conv2 = quantGATConv(hidden_units*heads, dataset.num_classes, heads=1, bit_assign=bit_assign, dropout=drop_attn, concat=False)
+
     def forward(self,data):
         x,edge_index = data.x, data.edge_index
         x = F.dropout(x, p=self.drop_out, training=self.training)
@@ -237,6 +399,7 @@ class GAT(torch.nn.Module):
         return F.softmax(x,dim=1)
 
 if __name__ == '__main__':
+    setup_seed(24)
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',type=str,default='GAT')
     parser.add_argument('--gpu_id',type=int,default=0)
@@ -271,7 +434,7 @@ if __name__ == '__main__':
     # Path to checkpoint
     parser.add_argument('--check_folder',type=str,default='checkpoint')
     # Path to dataset
-    parser.add_argument('--path2dataset',type=str,default='/')
+    parser.add_argument('--path2dataset',type=str,default='')
     args = parser.parse_args()
     print(args)
     
@@ -292,6 +455,7 @@ if __name__ == '__main__':
     dataset = Planetoid(root=args.path2dataset,name=dataset_name,)
     device = torch.device('cuda',args.gpu_id)
     data = dataset[0].to(device)
+    bit_assign = make_bit_assignments(dataset[0])
 
     if(resume==True):
         file_name = path2result+'/'+args.model+'_'+str(args.heads)+'_'+'_on_'+dataset_name+'_'+str(bit)+'bit-'+str(max_epoch)+'.txt'
@@ -333,12 +497,12 @@ if __name__ == '__main__':
                 model.train()
                 optimizer.zero_grad()
                 out = model(data)
-                wByte, aByte = parameter_stastic(model,dataset,hidden_units,args.heads)
-                loss_a = F.relu(aByte-args.a_storage)**2
-                loss_store = args.a_loss*loss_a
+                # wByte, aByte = parameter_stastic(model,dataset,hidden_units,args.heads)
+                # loss_a = F.relu(aByte-args.a_storage)**2
+                # loss_store = args.a_loss*loss_a
                 loss = F.cross_entropy(out[data.train_mask],data.y[data.train_mask])
-                if(args.is_q==True):
-                    loss_store.backward(retain_graph=True)
+                # if(args.is_q==True):
+                #     loss_store.backward(retain_graph=True)
                 loss.backward()
                 optimizer.step()
                 # Val
@@ -363,11 +527,11 @@ if __name__ == '__main__':
                 t.update(1)
                 if(acc>print_max_acc):
                     print_max_acc = acc
-                if((acc>max_acc)&(args.store_ckpt==True)):
-                    path = path2check+'/'+args.model+'_'+str(hidden_units)+'_on_'+dataset_name+'_'+str(bit)+'bit-'+str(max_epoch)+'.pth.tar'
-                    max_acc = acc
-                    torch.save({'state_dict': model.state_dict(), 'best_accu': acc, 'hidden_units':args.hidden_units, 'layers':
-                    args.num_layers, 'aByte':aByte}, path)
+                # if((acc>max_acc)&(args.store_ckpt==True)):
+                #     path = path2check+'/'+args.model+'_'+str(hidden_units)+'_on_'+dataset_name+'_'+str(bit)+'bit-'+str(max_epoch)+'.pth.tar'
+                #     max_acc = acc
+                #     torch.save({'state_dict': model.state_dict(), 'best_accu': acc, 'hidden_units':args.hidden_units, 'layers':
+                #     args.num_layers, 'aByte':aByte}, path)
             print(print_max_acc)
             if(resume==True):
                 f = open(file_name,'a')
@@ -389,7 +553,7 @@ if __name__ == '__main__':
             f.write(desc)
             f.write('\n')
         torch.cuda.empty_cache()
-    state = torch.load(path)
-    dict=state['state_dict']
-    analysis_bit(data,dict,all_positive=True)
+    # state = torch.load(path)
+    # dict=state['state_dict']
+    # analysis_bit(data,dict,all_positive=True)
     print("Result - {}".format(desc))

@@ -26,6 +26,8 @@ from quantize_function.u_quant_func_bit_debug import *
 from quantize_function.qGINConv import GIN
 from utils.quant_utils import analysis_bit
 import pdb
+from torch_geometric.utils import to_networkx, degree
+import networkx as nx
 def paras_group(model):
     all_params = model.parameters()
     weight_paras=[]
@@ -37,6 +39,7 @@ def paras_group(model):
     quant_paras_bit_xw = []
     other_paras = []
     for name,para in model.named_parameters():
+        print(name)
         if('quant' in name and 'bit' in name and 'weight' in name):
             quant_paras_bit_weight+=[para]
             # para.requires_grad = False
@@ -63,7 +66,8 @@ def setup_seed(seed):
      torch.cuda.manual_seed_all(seed)
      np.random.seed(seed)
      random.seed(seed)
-    #  torch.backends.cudnn.deterministic = True
+     torch.backends.cudnn.deterministic = True
+     torch.backends.cudnn.benchmark = False
 
 
 def parameter_stastic(model,dataset,hidden_units):
@@ -89,6 +93,34 @@ def load_checkpoint(model, checkpoint):
         print("loaded finished!")
     return model
 
+def make_bit_assignments(data, max_feat_bit=4, min_feat_bit=2):
+    # 1. Degree
+    deg = degree(data.edge_index[1], data.num_nodes, dtype=torch.float)
+    deg = torch.log1p(deg) / torch.log1p(deg.max())
+
+    # 2. Betweenness
+    G = to_networkx(data)
+    betw = torch.tensor([b for n, b in nx.betweenness_centrality(G).items()], device=data.edge_index.device)
+    # betw = betw / betw.max()
+    betw_a = 15000
+    betw = torch.log1p(betw_a * betw) / torch.log1p(betw_a * betw.max())
+
+    # # 5. Preliminary bits in [1…max_feat_bit]
+    # b_pre = (max_feat_bit*deg).round()
+    b_deg = min_feat_bit + ((max_feat_bit - min_feat_bit) * deg).round()
+    b_betw = min_feat_bit + ((max_feat_bit - min_feat_bit) * betw).round()
+    b_pre = torch.maximum(b_deg, b_betw)
+
+    # 6. Push anything above half‐max up to max
+    # b = b_deg.clone()
+    # b = b_betw.clone()
+    b = b_pre.clone()
+    # b[b_pre >= 2] = max_feat_bit
+    print(f"Average bit allocation: {b.float().mean():.2f}")
+    unique_vals, counts = torch.unique(b, return_counts=True)
+    for val, count in zip(unique_vals.tolist(), counts.tolist()):
+        print(f"Bit width {val}: {count} nodes")
+    return b
 
 class qGCNConv(MessagePassing):
     def __init__(self, in_channels, out_channels, num_nodes, bit, all_positive=False,
@@ -137,15 +169,22 @@ class GCN(torch.nn.Module):
         if(is_q==False):
             self.conv1 = GCNConv(dataset.num_node_features, hidden_units, bias=True,improved=False)
         else:
-            self.conv1 = qGCNConv(dataset.num_node_features, hidden_units, num_nodes, bit, all_positive=True,
-                                para_dict=para_list[0],
-                                quant_fea=False)
+            if args.taq:
+                self.conv1 = QuantGCNConv(dataset.num_node_features, hidden_units)
+            else:
+                self.conv1 = qGCNConv(dataset.num_node_features, hidden_units, num_nodes, bit, all_positive=True,
+                                    para_dict=para_list[0],
+                                    quant_fea=False)
         if(is_q==False):
             self.conv2 = GCNConv(hidden_units, dataset.num_classes,bias=True,improved=False)
         else:
-            self.conv2 = qGCNConv(hidden_units,dataset.num_classes, num_nodes, bit,
-                                para_dict=para_list[0],
-                                quant_fea=True)
+            if args.taq:
+                self.conv2 = QuantGCNConv(hidden_units, num_nodes)
+            else:
+                self.conv2 = qGCNConv(hidden_units,dataset.num_classes, num_nodes, bit,
+                                    para_dict=para_list[0],
+                                    quant_fea=True)
+            
     def forward(self,data):
         x,edge_index = data.x, data.edge_index
         x = self.conv1(x,edge_index)
@@ -154,9 +193,126 @@ class GCN(torch.nn.Module):
         x = self.conv2(x,edge_index)
         return F.log_softmax(x,dim=1)
 
+class QuantGCNConv(torch.nn.Module):
+    """
+    Wraps GCNConv to apply per-channel weight quantization on-the-fly.
+    """
+    def __init__(self, in_channels: int, out_channels: int,
+                 weight_bit: int = 4,
+                 feat_bit: int = 1,
+                 bias: bool = True):
+        super().__init__()
+        self.weight_bit = weight_bit
+        self.feat_bit = feat_bit
+        self.register_buffer('bit_assign', bit_assign)
+        self.conv = GCNConv(in_channels, out_channels, bias=bias)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        # # FIXED PRECISION Quantization
+        # x = STEQuantFn.apply(x, self.feat_bit)
+        
+        # MIXED PRECISION Quantization
+        x_q = x.clone()
+        for bit_val in self.bit_assign.unique().tolist():
+            mask = (self.bit_assign == bit_val)
+            if mask.any():
+                x_q[mask] = STEQuantFn.apply(x[mask], int(bit_val))
+        x = x_q
+        
+
+        w = self.conv.lin.weight
+        w_q = STEQuantFn.apply(w, self.weight_bit)
+        w_orig = w.clone()
+        self.conv.lin.weight.data.copy_(w_q.data)
+
+        # Convolution with quantized params
+        out = self.conv(x, edge_index)
+
+        # Restore full-precision weights
+        self.conv.lin.weight.data.copy_(w_orig)
+
+        return out
+
+class STEQuantFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, num_bits):
+        qmin, qmax = 0, 2**num_bits - 1
+        min_val, max_val = x.min(), x.max()
+        scale = (max_val - min_val) / (qmax - qmin)
+        zp = min_val
+        x_q = torch.clamp(((x - zp) / scale).round(), qmin, qmax) * scale + zp
+        return x_q
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # STE: pass gradient as-is
+        return grad_output, None
+
+
+# class QuantGCNConv(torch.nn.Module):
+#     """
+#     Wraps GCNConv to apply per‐row mixed‐precision feature quantization
+#     and uniform weight quantization on‐the‐fly, without any Python loop.
+#     """
+#     def __init__(self, in_channels: int, out_channels: int,
+#                  weight_bit: int = 4,
+#                  feat_bit: int = 4,
+#                  bias: bool = True):
+#         super().__init__()
+#         self.weight_bit = weight_bit
+#         # bit_assign is a 1D LongTensor of length num_rows,
+#         # holding the bit‐width for each node/row.
+#         # e.g. tensor([2,4,4,2,3,…])
+#         self.register_buffer('bit_assign', bit_assign)  
+#         self.conv = GCNConv(in_channels, out_channels, bias=bias)
+
+#     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+#         # x: [num_rows, num_features]
+#         # bit_assign: [num_rows]
+#         b = self.bit_assign.unsqueeze(1).to(x.device)       # → [num_rows,1]
+        
+#         # Compute per‐row min/max
+#         x_min = x.min(dim=1, keepdim=True).values            # → [num_rows,1]
+#         x_max = x.max(dim=1, keepdim=True).values            # → [num_rows,1]
+        
+#         # Compute qmax = 2^b - 1, but as float
+#         qmax = (2**b - 1).float()                            # → [num_rows,1]
+        
+#         # Scale, avoiding divide‐by‐zero
+#         scale = (x_max - x_min) / qmax                       # → [num_rows,1]
+#         scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        
+#         # Normalize, round, clamp, de‐normalize
+#         x_norm = (x - x_min) / scale                         # → [num_rows, num_features]
+#         # x_q    = torch.clamp(x_norm.round(), 0, qmax) * scale + x_min
+#         x_q = torch.clamp(
+#             x_norm.round(),
+#             min=torch.zeros_like(qmax),
+#             max=qmax
+#         ) * scale + x_min
+
+        
+#         # Replace x with quantized version
+#         x = x_q
+        
+#         # --- now do weight quantization as before ---
+#         w      = self.conv.lin.weight
+#         w_q    = STEQuantFn.apply(w, self.weight_bit)
+#         w_orig = w.clone()
+#         self.conv.lin.weight.data.copy_(w_q.data)
+
+#         # Convolution
+#         out = self.conv(x, edge_index)
+
+#         # Restore full‐precision weights
+#         self.conv.lin.weight.data.copy_(w_orig)
+#         return out
+    
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model',type=str,default='GIN')
+    parser.add_argument('--taq', action='store_true')      # TAQ if true, A2Q if false
+    parser.add_argument('--model',type=str,default='GCN')
     parser.add_argument('--gpu_id',type=int,default=0)
     parser.add_argument('--dataset_name',type=str,default='Cora')
     parser.add_argument('--num_layers', type=int, default=2)
@@ -184,10 +340,11 @@ if __name__ == '__main__':
     # Path to checkpoint
     parser.add_argument('--check_folder',type=str,default='checkpoint')
     # Path to dataset
-    parser.add_argument('--path2dataset',type=str,default='/')
+    parser.add_argument('--path2dataset',type=str,default='')
     args = parser.parse_args()
     print(args)
     
+    setup_seed(42)
     # os.environ['CUDA_VISIBLE_DEVICES']=args.gpu_id
     dataset_name = args.dataset_name
     num_layers = args.num_layers
@@ -204,6 +361,9 @@ if __name__ == '__main__':
     dataset = Planetoid(root=args.path2dataset,name=dataset_name,)
     device = torch.device('cuda',args.gpu_id)
     data = dataset[0].to(device)
+    bit_assign = make_bit_assignments(dataset[0])
+    # print(bit_assign[:1000])
+    # assert(0)
 
     # Record the accuracy
     if(resume==True):
@@ -247,13 +407,13 @@ if __name__ == '__main__':
                 model.train()
                 optimizer.zero_grad()
                 out = model(data)
-                wByte, aByte = parameter_stastic(model,dataset,hidden_units)
-                loss_a = F.relu(aByte-args.a_storage)**2
-                # pdb.set_trace()
-                loss_store = args.a_loss*loss_a
+                # wByte, aByte = parameter_stastic(model,dataset,hidden_units)
+                # loss_a = F.relu(aByte-args.a_storage)**2
+                # # pdb.set_trace()
+                # loss_store = args.a_loss*loss_a
                 loss = F.nll_loss(out[data.train_mask],data.y[data.train_mask])
-                if(args.is_q==True):
-                    loss_store.backward(retain_graph=True)
+                # if(args.is_q==True):
+                #     loss_store.backward(retain_graph=True)
                 loss.backward()
                 optimizer.step()
                 
@@ -282,8 +442,8 @@ if __name__ == '__main__':
                 if((acc>max_acc)&(args.store_ckpt==True)):
                     path = path2check+'/'+args.model+'_'+str(hidden_units)+'_on_'+dataset_name+'_'+str(bit)+'bit-'+str(max_epoch)+'.pth.tar'
                     max_acc = acc
-                    torch.save({'state_dict': model.state_dict(), 'best_accu': acc, 'hidden_units':args.hidden_units, 'layers':
-                    args.num_layers, 'aByte':aByte}, path)
+                    # torch.save({'state_dict': model.state_dict(), 'best_accu': acc, 'hidden_units':args.hidden_units, 'layers':
+                    # args.num_layers, 'aByte':aByte}, path)
             print(print_max_acc)
             if(resume==True):
                 f = open(file_name,'a')
@@ -305,6 +465,6 @@ if __name__ == '__main__':
     # Observe the learned bitwidth
     state = torch.load(path)
     dict=state['state_dict']
-    analysis_bit(data,dict,all_positive=True)
+    # analysis_bit(data,dict,all_positive=True)
     print("Result - {}".format(desc))
     
